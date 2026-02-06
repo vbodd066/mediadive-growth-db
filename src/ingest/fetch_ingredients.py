@@ -1,60 +1,58 @@
-import json
-import sqlite3
-import time
-from pathlib import Path
+"""
+Ingest ingredient master data from the MediaDive REST API.
 
-from src.api.client import get
+Endpoints used:
+    GET /ingredients?limit=N&offset=M  → paginated ingredient list
+    GET /ingredient/:id                → full detail (synonyms, roles, media list)
+"""
 
-RAW_DIR = Path("data/raw/ingredients")
-DB_PATH = Path("data/mediadive.db")
+from __future__ import annotations
 
-LIMIT = 200
-DELAY = 0.5
+import logging
+
+from src.api.client import paginate
+from src.db.queries import connect, is_task_done, mark_task_done
+
+log = logging.getLogger(__name__)
 
 
-def fetch_all_ingredients():
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+def fetch_ingredient_list(db_path=None) -> int:
+    """Fetch all ingredients from the paginated /ingredients endpoint."""
+    task = "ingredient_list"
+    if is_task_done(task, db_path):
+        log.info("Skipping %s (already done)", task)
+        with connect(db_path) as conn:
+            return conn.execute("SELECT COUNT(*) FROM ingredients").fetchone()[0]
 
-    offset = 0
-    page = 0
+    total = 0
+    with connect(db_path) as conn:
+        for page in paginate("/ingredients", limit=200):
+            for ing in page:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO ingredients
+                        (ingredient_id, ingredient_name, chebi_id, cas_rn,
+                         pubchem_id, molar_mass, formula, density)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ing["id"],
+                        ing["name"],
+                        ing.get("ChEBI"),
+                        ing.get("CAS-RN"),
+                        ing.get("PubChem"),
+                        ing.get("mass"),
+                        ing.get("formula"),
+                        ing.get("density"),
+                    ),
+                )
+            conn.commit()
+            total += len(page)
 
-    while True:
-        print(f"Fetching ingredients page {page}")
-
-        resp = get("/ingredients", params={"limit": LIMIT, "offset": offset})
-        data = resp.get("data", [])
-
-        if not data:
-            break
-
-        with open(RAW_DIR / f"ingredients_offset_{offset}.json", "w") as f:
-            json.dump(data, f, indent=2)
-
-        for ing in data:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO ingredients
-                (ingredient_id, ingredient_name, ingredient_class, formula, kegg_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    ing["id"],
-                    ing["name"],
-                    ing.get("class"),
-                    ing.get("formula"),
-                    ing.get("kegg_id"),
-                ),
-            )
-
-        conn.commit()
-        offset += LIMIT
-        page += 1
-        time.sleep(DELAY)
-
-    conn.close()
-    print("Finished ingesting ingredients")
+    mark_task_done(task, db_path)
+    log.info("Fetched %d ingredients.", total)
+    return total
 
 
 if __name__ == "__main__":
-    fetch_all_ingredients()
+    fetch_ingredient_list()

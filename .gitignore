@@ -1,10 +1,52 @@
+# Byte-compiled / optimized
 __pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables
 .env
-*.db
+
+# IDE
+.idea/
+.vscode/settings.json
+*.swp
+
+# Jupyter
 .ipynb_checkpoints/
 
+# Database
+*.db
+
+# Data artifacts (keep .gitkeep sentinel files)
 data/raw/*
 data/interim/*
+data/processed/*
+data/models/*
 !data/raw/.gitkeep
 !data/interim/.gitkeep
-!data/releases/
+!data/processed/.gitkeep
+!data/models/.gitkeep
+
+# Experiment tracking
+wandb/
+mlruns/
+
+# OS
+.DS_Store
+
+# Model artifacts
+*.pt
+*.pth
+*.onnx
+*.safetensors
