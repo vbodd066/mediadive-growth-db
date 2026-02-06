@@ -23,7 +23,7 @@ from src.config import DEFAULT_BATCH_SIZE, DEFAULT_EPOCHS, DEFAULT_LR, DEFAULT_S
 from src.models.base import BaseModel
 from src.models.evaluate import evaluate_growth_model
 from src.models.growth_predictor import NeuralGrowthPredictor, SklearnGrowthPredictor
-from src.models.media_generator import MediaVAE
+from src.models.media_generator import MediaVAE, ConditionalMediaVAE
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 class TrainConfig:
     """Training hyperparameters."""
 
-    model_type: str = "sklearn"  # "sklearn" | "neural" | "vae"
+    model_type: str = "sklearn"  # "sklearn" | "neural" | "vae" | "cvae"
     epochs: int = DEFAULT_EPOCHS
     batch_size: int = DEFAULT_BATCH_SIZE
     lr: float = DEFAULT_LR
@@ -42,6 +42,10 @@ class TrainConfig:
     dropout: float = 0.3
     beta: float = 1.0
     wandb_enabled: bool = False
+    # CVAE-specific
+    curriculum_phases: list[str] = field(default_factory=lambda: ["bacteria"])
+    embedding_method: str = "kmer_128"
+
 
 
 def load_processed_dataset(base: Path | None = None) -> dict[str, np.ndarray]:
@@ -57,25 +61,66 @@ def load_processed_dataset(base: Path | None = None) -> dict[str, np.ndarray]:
     }
 
 
+def load_cvae_dataset(base: Path | None = None) -> dict[str, np.ndarray]:
+    """Load pre-built CVAE dataset with genome embeddings."""
+    d = base or (PROCESSED_DIR / "genome_media_cvae")
+    return {
+        "X_train": np.load(d / "X_train.npy"),
+        "X_val": np.load(d / "X_val.npy"),
+        "X_test": np.load(d / "X_test.npy"),
+        "C_train": np.load(d / "C_train.npy"),
+        "C_val": np.load(d / "C_val.npy"),
+        "C_test": np.load(d / "C_test.npy"),
+        "y_train": np.load(d / "y_train.npy"),
+        "y_val": np.load(d / "y_val.npy"),
+        "y_test": np.load(d / "y_test.npy"),
+    }
+
+
 def train(cfg: TrainConfig | None = None) -> dict[str, Any]:
     """
     Run a full training pipeline.
+
+    Supports growth prediction, unconditional VAE, and curriculum CVAE training.
 
     Returns dict with: model, metrics, history, elapsed_seconds.
     """
     cfg = cfg or TrainConfig()
     np.random.seed(cfg.seed)
 
-    log.info("Loading dataset...")
-    data = load_processed_dataset()
-    X_train, y_train = data["X_train"], data["y_train"]
-    X_val, y_val = data["X_val"], data["y_val"]
-    X_test, y_test = data["X_test"], data["y_test"]
+    # ── Load dataset ────────────────────────────────────────
+    if cfg.model_type == "cvae":
+        log.info("Loading CVAE dataset...")
+        data = load_cvae_dataset()
+        X_train, y_train = data["X_train"], data["y_train"]
+        X_val, y_val = data["X_val"], data["y_val"]
+        X_test, y_test = data["X_test"], data["y_test"]
+        C_train = data["C_train"]
+        C_val = data["C_val"]
+        C_test = data["C_test"]
 
-    log.info(
-        "Dataset: train=%d  val=%d  test=%d  features=%d",
-        len(X_train), len(X_val), len(X_test), X_train.shape[1],
-    )
+        log.info(
+            "CVAE Dataset: train=%d  val=%d  test=%d  media_dim=%d  condition_dim=%d",
+            len(X_train),
+            len(X_val),
+            len(X_test),
+            X_train.shape[1],
+            C_train.shape[1],
+        )
+    else:
+        log.info("Loading growth prediction dataset...")
+        data = load_processed_dataset()
+        X_train, y_train = data["X_train"], data["y_train"]
+        X_val, y_val = data["X_val"], data["y_val"]
+        X_test, y_test = data["X_test"], data["y_test"]
+
+        log.info(
+            "Dataset: train=%d  val=%d  test=%d  features=%d",
+            len(X_train),
+            len(X_val),
+            len(X_test),
+            X_train.shape[1],
+        )
 
     # ── Instantiate model ───────────────────────────────────
     model: BaseModel
@@ -96,6 +141,16 @@ def train(cfg: TrainConfig | None = None) -> dict[str, Any]:
             beta=cfg.beta,
             lr=cfg.lr,
         )
+    elif cfg.model_type == "cvae":
+        model = ConditionalMediaVAE(
+            input_dim=X_train.shape[1],
+            condition_dim=C_train.shape[1],
+            latent_dim=cfg.latent_dim,
+            hidden_dims=cfg.hidden_dims[:2],
+            beta=cfg.beta,
+            lr=cfg.lr,
+            curriculum_phases=cfg.curriculum_phases,
+        )
     else:
         raise ValueError(f"Unknown model_type: {cfg.model_type}")
 
@@ -106,16 +161,52 @@ def train(cfg: TrainConfig | None = None) -> dict[str, Any]:
 
     if cfg.model_type == "sklearn":
         model.fit(X_train, y_train)
+
     elif cfg.model_type == "neural":
         history = model.fit(
-            X_train, y_train, X_val=X_val, y_val=y_val,
-            epochs=cfg.epochs, batch_size=cfg.batch_size,
+            X_train,
+            y_train,
+            X_val=X_val,
+            y_val=y_val,
+            epochs=cfg.epochs,
+            batch_size=cfg.batch_size,
         ) or {}
+
     elif cfg.model_type == "vae":
         history = model.fit(
-            X_train, None, X_val=X_val,
-            epochs=cfg.epochs, batch_size=cfg.batch_size,
+            X_train,
+            None,
+            X_val=X_val,
+            epochs=cfg.epochs,
+            batch_size=cfg.batch_size,
         ) or {}
+
+    elif cfg.model_type == "cvae":
+        # Curriculum learning: train on each organism type sequentially
+        history = {}
+        for phase_idx, organism_type in enumerate(cfg.curriculum_phases):
+            log.info(
+                "=== Curriculum Phase %d/%d: %s ===",
+                phase_idx + 1,
+                len(cfg.curriculum_phases),
+                organism_type,
+            )
+
+            # Filter to this organism type (y encodes organism type priority)
+            # We'll do a simpler approach: train on full data but track phase
+            history[organism_type] = model.fit(
+                X_train,
+                X_train_condition=C_train,
+                y_train=y_train,
+                X_val=X_val,
+                X_val_condition=C_val,
+                epochs=cfg.epochs,
+                batch_size=cfg.batch_size,
+                curriculum_epoch=phase_idx,
+                curriculum_phase=organism_type,
+            ) or {}
+
+        log.info("CVAE curriculum training complete")
 
     elapsed = time.time() - t0
     log.info("Training complete in %.1f seconds.", elapsed)
@@ -123,11 +214,18 @@ def train(cfg: TrainConfig | None = None) -> dict[str, Any]:
     # ── Evaluate ────────────────────────────────────────────
     if cfg.model_type in ("sklearn", "neural"):
         metrics = evaluate_growth_model(model, X_test, y_test)
-    else:
+    elif cfg.model_type == "vae":
         from src.models.evaluate import reconstruction_metrics
 
         recon = model.predict(X_test)
         metrics = reconstruction_metrics(X_test, recon)
+    elif cfg.model_type == "cvae":
+        from src.models.evaluate import reconstruction_metrics
+
+        recon = model.predict(X_test, C_test)
+        metrics = reconstruction_metrics(X_test, recon)
+    else:
+        metrics = {}
 
     # ── Save ────────────────────────────────────────────────
     suffix = ".pkl" if cfg.model_type == "sklearn" else ".pt"

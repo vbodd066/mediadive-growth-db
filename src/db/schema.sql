@@ -135,6 +135,51 @@ CREATE TABLE IF NOT EXISTS strain_growth (
 );
 
 -- ─────────────────────────────────────────
+-- Genomes — microbial genomic sequences
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS genomes (
+    genome_id         TEXT PRIMARY KEY,           -- unique identifier (e.g. "GCF_000001405.40")
+    strain_id         INTEGER,                    -- FK to strains (optional, may be NULL)
+    organism_name     TEXT NOT NULL,
+    organism_type     TEXT NOT NULL,              -- 'bacteria', 'archea', 'fungi', 'protist', 'virus'
+    taxid             INTEGER,                    -- NCBI taxonomy ID
+    gc_content        REAL,                       -- GC% (0-100)
+    sequence_length   INTEGER,                    -- base pairs
+    fasta_path        TEXT,                       -- local path to FASTA file (relative to data/raw/genomes/)
+    fasta_hash        TEXT,                       -- SHA-256 hash of FASTA content
+    fetched_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (strain_id) REFERENCES strains(strain_id)
+);
+
+-- ─────────────────────────────────────────
+-- Genome embeddings — pre-computed features
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS genome_embeddings (
+    genome_id         TEXT PRIMARY KEY,
+    embedding_model   TEXT NOT NULL,              -- e.g. 'kmer_128', 'prottrans_t5', 'genomic_features'
+    embedding         BLOB,                       -- binary-encoded numpy array (pickle or msgpack)
+    embedding_dim     INTEGER NOT NULL,
+    computed_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (genome_id) REFERENCES genomes(genome_id)
+);
+
+-- ─────────────────────────────────────────
+-- Genome ↔ media growth observations
+-- (supplements strain_growth with genomic data)
+-- ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS genome_growth (
+    genome_id         TEXT NOT NULL,
+    media_id          TEXT NOT NULL,
+    growth            BOOLEAN NOT NULL,           -- 1 = grows, 0 = does not
+    growth_rate       TEXT,
+    confidence        REAL,                       -- confidence score [0-1]
+    source            TEXT,                       -- e.g. 'literature', 'experiment', 'in_silico'
+    PRIMARY KEY (genome_id, media_id),
+    FOREIGN KEY (genome_id) REFERENCES genomes(genome_id),
+    FOREIGN KEY (media_id)  REFERENCES media(media_id)
+);
+
+-- ─────────────────────────────────────────
 -- Ingest progress tracking
 -- ─────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS ingest_log (
@@ -158,3 +203,9 @@ CREATE INDEX IF NOT EXISTS idx_growth_media        ON strain_growth(media_id);
 CREATE INDEX IF NOT EXISTS idx_growth_strain       ON strain_growth(strain_id);
 CREATE INDEX IF NOT EXISTS idx_composition_media   ON media_composition(media_id);
 CREATE INDEX IF NOT EXISTS idx_solution_recipe_ing ON solution_recipe(ingredient_id);
+CREATE INDEX IF NOT EXISTS idx_genome_organism_type ON genomes(organism_type);
+CREATE INDEX IF NOT EXISTS idx_genome_taxid       ON genomes(taxid);
+CREATE INDEX IF NOT EXISTS idx_genome_strain      ON genomes(strain_id);
+CREATE INDEX IF NOT EXISTS idx_genome_emb_model   ON genome_embeddings(embedding_model);
+CREATE INDEX IF NOT EXISTS idx_genome_growth_media ON genome_growth(media_id);
+CREATE INDEX IF NOT EXISTS idx_genome_growth_genome ON genome_growth(genome_id);
